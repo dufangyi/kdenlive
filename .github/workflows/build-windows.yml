@@ -1,64 +1,83 @@
-name: Build Kdenlive Windows
+name: Build Kdenlive on Windows (via Craft)
+
 on:
+  workflow_dispatch:      # 允许在 GitHub 页面上手动点击运行
   push:
-    branches: [ master ]
-  workflow_dispatch:
+    branches: [ master ]  # 也可以设置为 push 时自动触发，按需修改
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
-    timeout-minutes: 180
-    defaults:
-      run:
-        shell: msys2 {0}
+    timeout-minutes: 360   # Craft 首次构建需要下载并编译大量依赖，耗时较长
+
     steps:
       - name: Checkout Kdenlive source
         uses: actions/checkout@v4
         with:
           path: kdenlive
-          fetch-depth: 1
 
-      - name: Setup MSYS2 UCRT64
-        uses: msys2/setup-msys2@v2
+      # Craft 在 Windows 上依赖 Python 来运行引导脚本
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          msystem: UCRT64
-          update: true
-          install: >
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-qt6-base
-            mingw-w64-ucrt-x86_64-qt6-multimedia
-            mingw-w64-ucrt-x86_64-qt6-svg
-            mingw-w64-ucrt-x86_64-qt6-tools
-            mingw-w64-ucrt-x86_64-qt6-networkauth
-            mingw-w64-ucrt-x86_64-kf6
-            mingw-w64-ucrt-x86_64-mlt
-            mingw-w64-ucrt-x86_64-ffmpeg
-            mingw-w64-ucrt-x86_64-kddockwidgets
-            git
+          python-version: '3.12'
 
-      - name: CMake configure & build
+      # 下载 Craft 的引导脚本 CraftBootstrap.py
+      - name: Download Craft Bootstrap
+        shell: pwsh
         run: |
-          cd $GITHUB_WORKSPACE/kdenlive
-          mkdir build && cd build
-          cmake -G Ninja \
-            -DCMAKE_INSTALL_PREFIX=$PWD/install \
-            -DBUILD_TESTING=OFF \
-            -DQT_MAJOR_VERSION=6 \
-            -DBUILD_WITH_QT6=ON \
-            ..
-          ninja -j${NUMBER_OF_PROCESSORS}
-          ninja install
+          $craftDir = "C:\Craft"
+          New-Item -ItemType Directory -Force -Path $craftDir
+          Invoke-WebRequest -Uri "https://cgit.kde.org/craft.git/plain/setup/CraftBootstrap.py" -OutFile "$craftDir\CraftBootstrap.py"
 
-      - name: Bundle portable package (collect dlls)
+      # 运行引导脚本，自动选择 MinGW 编译器
+      # 这一步会下载 Craft 核心并初始化环境
+      - name: Bootstrap Craft Environment
+        shell: pwsh
+        working-directory: C:\Craft
         run: |
-          cd $GITHUB_WORKSPACE/kdenlive/build/install
-          windeployqt --release kdenlive.exe
-          7z a -t7z $GITHUB_WORKSPACE/kdenlive-win-portable.7z *
+          python CraftBootstrap.py --install-deps --no-cache --compiler=mingw
+          # 引导完成后会生成 craftenv.ps1，后续步骤都在该环境中执行
 
-      - name: Upload artifact
+      # 进入 Craft 环境，将 Kdenlive 源码链接到 Craft 的源码目录，
+      # 然后让 Craft 接管后续的依赖解析与编译
+      - name: Build Kdenlive with Craft
+        shell: pwsh
+        working-directory: C:\Craft
+        run: |
+          . .\craftenv.ps1
+          
+          # 将签出的 Kdenlive 源码目录链接到 Craft 预期的位置
+          # 这样 Craft 就不会重新去 git clone，而是直接编译你的代码
+          $craftSourceDir = "C:\Craft\sources\kdenlive"
+          if (Test-Path $craftSourceDir) { Remove-Item -Recurse -Force $craftSourceDir }
+          cmd /c mklink /J "$craftSourceDir" "${{ github.workspace }}\kdenlive"
+
+          # 正式编译 Kdenlive
+          # 首次运行会花费很长时间，因为 Craft 需要先编译 Qt6、KDE Frameworks 6、MLT 等
+          craft kdenlive
+
+      # 将编译产物（kdenlive.exe 及其运行时依赖）打包上传
+      # Craft 的安装根目录通常是 C:\Craft\bin 和 C:\Craft\lib，但为了稳妥，我们直接定位可执行文件所在目录
+      - name: Collect and Upload Artifact
+        shell: pwsh
+        run: |
+          . C:\Craft\craftenv.ps1
+          
+          # Craft 安装后的程序通常位于 C:\Craft\bin
+          $binDir = "C:\Craft\bin"
+          if (Test-Path "$binDir\kdenlive.exe") {
+            # 将整个 bin 目录（包含 kdenlive.exe 及其依赖的 DLL）打包
+            Compress-Archive -Path "$binDir\*" -DestinationPath "kdenlive-windows.zip"
+          } else {
+            # 如果 Craft 的安装前缀不同，可以打印出来辅助排查
+            Write-Error "kdenlive.exe not found in $binDir. Listing C:\Craft\bin:"
+            Get-ChildItem C:\Craft\bin | Select-Object Name
+            exit 1
+          }
+
+      - name: Upload Kdenlive Windows Build
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-windows-portable
-          path: kdenlive-win-portable.7z
+          name: kdenlive-windows
+          path: kdenlive-windows.zip
