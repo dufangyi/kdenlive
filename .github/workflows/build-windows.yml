@@ -1,83 +1,85 @@
-name: Build Kdenlive on Windows (via Craft)
+name: Build Kdenlive on Windows (MSYS2)
 
 on:
-  workflow_dispatch:      # 允许在 GitHub 页面上手动点击运行
-  push:
-    branches: [ master ]  # 也可以设置为 push 时自动触发，按需修改
+  workflow_dispatch:      # 手动触发
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
-    timeout-minutes: 360   # Craft 首次构建需要下载并编译大量依赖，耗时较长
+    timeout-minutes: 120  # MSYS2 预编译依赖，时间会短很多，120 分钟通常足够
 
     steps:
-      - name: Checkout Kdenlive source
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           path: kdenlive
 
-      # Craft 在 Windows 上依赖 Python 来运行引导脚本
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
         with:
-          python-version: '3.12'
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-extra-cmake-modules
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-qt6-networkauth
+            mingw-w64-x86_64-qt6-declarative
+            mingw-w64-x86_64-kf6
+            mingw-w64-x86_64-mlt
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-frei0r-plugins
+            mingw-w64-x86_64-ladspa-sdk
+            mingw-w64-x86_64-libfftw
 
-      # 下载 Craft 的引导脚本 CraftBootstrap.py
-      - name: Download Craft Bootstrap
-        shell: pwsh
+      - name: Configure and build
+        shell: msys2 {0}
         run: |
-          $craftDir = "C:\Craft"
-          New-Item -ItemType Directory -Force -Path $craftDir
-          Invoke-WebRequest -Uri "https://cgit.kde.org/craft.git/plain/setup/CraftBootstrap.py" -OutFile "$craftDir\CraftBootstrap.py"
-
-      # 运行引导脚本，自动选择 MinGW 编译器
-      # 这一步会下载 Craft 核心并初始化环境
-      - name: Bootstrap Craft Environment
-        shell: pwsh
-        working-directory: C:\Craft
-        run: |
-          python CraftBootstrap.py --install-deps --no-cache --compiler=mingw
-          # 引导完成后会生成 craftenv.ps1，后续步骤都在该环境中执行
-
-      # 进入 Craft 环境，将 Kdenlive 源码链接到 Craft 的源码目录，
-      # 然后让 Craft 接管后续的依赖解析与编译
-      - name: Build Kdenlive with Craft
-        shell: pwsh
-        working-directory: C:\Craft
-        run: |
-          . .\craftenv.ps1
+          cd "$GITHUB_WORKSPACE/kdenlive"
+          mkdir build && cd build
           
-          # 将签出的 Kdenlive 源码目录链接到 Craft 预期的位置
-          # 这样 Craft 就不会重新去 git clone，而是直接编译你的代码
-          $craftSourceDir = "C:\Craft\sources\kdenlive"
-          if (Test-Path $craftSourceDir) { Remove-Item -Recurse -Force $craftSourceDir }
-          cmd /c mklink /J "$craftSourceDir" "${{ github.workspace }}\kdenlive"
+          # 使用 Ninja 加速构建，并指定安装前缀
+          cmake .. \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install"
+          
+          ninja
+          ninja install
 
-          # 正式编译 Kdenlive
-          # 首次运行会花费很长时间，因为 Craft 需要先编译 Qt6、KDE Frameworks 6、MLT 等
-          craft kdenlive
-
-      # 将编译产物（kdenlive.exe 及其运行时依赖）打包上传
-      # Craft 的安装根目录通常是 C:\Craft\bin 和 C:\Craft\lib，但为了稳妥，我们直接定位可执行文件所在目录
-      - name: Collect and Upload Artifact
+      - name: Collect artifact
         shell: pwsh
         run: |
-          . C:\Craft\craftenv.ps1
+          # MSYS2 的安装前缀默认是 /mingw64，ninja install 会把文件放到 MSYS2 根目录下
+          # 但我们在 CMake 中指定了 CMAKE_INSTALL_PREFIX，所以文件应该在 $GITHUB_WORKSPACE/install
+          # 如果目录为空，回退到 MSYS2 的 /mingw64 目录
+          $installDir = "${{ github.workspace }}\install"
+          if (-not (Test-Path "$installDir\bin\kdenlive.exe")) {
+            Write-Host "Install prefix empty, falling back to MSYS2 /mingw64"
+            $installDir = "C:\msys64\mingw64"
+          }
           
-          # Craft 安装后的程序通常位于 C:\Craft\bin
-          $binDir = "C:\Craft\bin"
-          if (Test-Path "$binDir\kdenlive.exe") {
-            # 将整个 bin 目录（包含 kdenlive.exe 及其依赖的 DLL）打包
-            Compress-Archive -Path "$binDir\*" -DestinationPath "kdenlive-windows.zip"
+          # 打包 exe 及其所需 DLL（通过 ldd 自动收集，或直接打包整个 bin 目录）
+          # 这里采取稳妥做法：打包 install 目录（如果存在）或直接打包 MSYS2 的 mingw64/bin 中 kdenlive 相关文件
+          if (Test-Path "$installDir\bin\kdenlive.exe") {
+            Compress-Archive -Path "$installDir\*" -DestinationPath "kdenlive-windows.zip"
           } else {
-            # 如果 Craft 的安装前缀不同，可以打印出来辅助排查
-            Write-Error "kdenlive.exe not found in $binDir. Listing C:\Craft\bin:"
-            Get-ChildItem C:\Craft\bin | Select-Object Name
-            exit 1
+            # 最后兜底：从 MSYS2 目录中收集 kdenlive 主程序及必要 DLL
+            New-Item -ItemType Directory -Force -Path "package\bin" | Out-Null
+            Copy-Item "C:\msys64\mingw64\bin\kdenlive.exe" "package\bin\"
+            # 简单收集 mingw64/bin 下所有 DLL，实际可能需要按 ldd 结果筛选
+            Copy-Item "C:\msys64\mingw64\bin\*.dll" "package\bin\"
+            Compress-Archive -Path "package\*" -DestinationPath "kdenlive-windows.zip"
           }
 
-      - name: Upload Kdenlive Windows Build
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kdenlive-windows
+          name: kdenlive-windows-msys2
           path: kdenlive-windows.zip
